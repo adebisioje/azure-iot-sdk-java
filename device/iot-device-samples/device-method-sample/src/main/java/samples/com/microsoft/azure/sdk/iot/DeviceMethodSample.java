@@ -130,6 +130,5 @@ public class DeviceMethodSample
         scanner.nextLine();
         client.close();
         System.out.println("Shutting down...");
-
     }
 }
