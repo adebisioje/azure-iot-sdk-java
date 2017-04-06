@@ -16,19 +16,14 @@ import com.microsoft.azure.sdk.iot.service.devicetwin.DeviceMethod;
 import com.microsoft.azure.sdk.iot.service.devicetwin.MethodResult;
 import com.microsoft.azure.sdk.iot.service.exceptions.IotHubException;
 import com.microsoft.azure.sdk.iot.service.exceptions.IotHubGatewayTimeoutException;
-import com.sun.xml.internal.ws.policy.privateutil.PolicyUtils;
-import org.junit.AfterClass;
-import org.junit.Before;
-import org.junit.BeforeClass;
-import org.junit.Test;
+import org.junit.*;
 
 import java.io.IOException;
 import java.io.UnsupportedEncodingException;
 import java.net.URISyntaxException;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Map;
-import java.util.UUID;
+import java.security.NoSuchAlgorithmException;
+import java.util.*;
+import java.util.concurrent.ConcurrentSkipListSet;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -40,14 +35,18 @@ import static org.junit.Assert.*;
  */
 public class DeviceMethodIT
 {
-    private static String iotHubConnectionStringEnvVarName = "IOTHUB_CONNECTION_STRING";
+    private static final Integer MAX_DEVICE_PARALLEL = 2;
+    private static final int NUMBER_INVOKES_PARALLEL = 100;
+
+    private static final String iotHubConnectionStringEnvVarName = "IOTHUB_CONNECTION_STRING";
     private static String iotHubConnectionString = "";
-    private static String deviceConnectionString = "";
     private static RegistryManager registryManager;
     private static IotHubClientProtocol deviceClientProtocol = IotHubClientProtocol.MQTT;
     private static DeviceClient deviceClient;
     private static DeviceMethod methodServiceClient;
+    private static Device[] testDeviceArray = new Device[MAX_DEVICE_PARALLEL];
 
+    private static TestDeviceMethodCallback testDeviceMethodCallback = new TestDeviceMethodCallback();
     private static DeviceMethodStatusCallback deviceMethodStatusCallback = new DeviceMethodStatusCallback();
 
     private static class DeviceStatus
@@ -55,13 +54,15 @@ public class DeviceMethodIT
         IotHubStatusCode status;
     }
     private static DeviceStatus deviceMethodStatusCallbackResult = new DeviceStatus();
-    private static final AtomicBoolean succeed = new AtomicBoolean();
+    private static AtomicBoolean succeed = new AtomicBoolean();
+    private static ConcurrentSkipListSet<String> failReason = new ConcurrentSkipListSet<>();
+    private static String uuid = UUID.randomUUID().toString();
 
-
-    private static String DEVICE_ID_NAME = "java-e2e-test";
+    private static String baseDeviceId = "E2EJavaMQTT";
+    private static Device testDevice;
     private static final String METHOD_LOOPBACK = "loopback";
     private static final String METHOD_DELAY_IN_MILLISECONDS = "delayInMilliseconds";
-    private static final String METHOD_UNKNOWN = "blah";
+    private static final String METHOD_UNKNOWN = "unknown";
 
     private static final Long RESPONSE_TIMEOUT = TimeUnit.SECONDS.toSeconds(200);
     private static final Long CONNECTION_TIMEOUT = TimeUnit.SECONDS.toSeconds(5);
@@ -70,8 +71,6 @@ public class DeviceMethodIT
     private static final int METHOD_SUCCESS = 200;
     private static final int METHOD_THROWS = 403;
     private static final int METHOD_NOT_DEFINED = 404;
-
-    private static final int NUMBER_INVOKES_PARALLEL = 100;
 
 
     @BeforeClass
@@ -93,64 +92,27 @@ public class DeviceMethodIT
         }
 
         methodServiceClient = DeviceMethod.createFromConnectionString(iotHubConnectionString);
-
         registryManager = RegistryManager.createFromConnectionString(iotHubConnectionString);
 
-        deviceConnectionString = provisioningDevice();
-
-        deviceClient = new DeviceClient(deviceConnectionString, deviceClientProtocol);
         try
         {
+            testDevice = provisioningDevice(baseDeviceId);
+            deviceClient = new DeviceClient(getConnectionString(iotHubConnectionString, testDevice), deviceClientProtocol);
             deviceClient.open();
-            deviceClient.subscribeToDeviceMethod(new TestDeviceMethodCallback(), null, deviceMethodStatusCallback, deviceMethodStatusCallbackResult);
+            deviceClient.subscribeToDeviceMethod(testDeviceMethodCallback, null, deviceMethodStatusCallback, deviceMethodStatusCallbackResult);
         }
         catch (Exception e)
         {
-            removeDevice();
-            throw new IOException(e);
+            removeDevices();
+            throw e;
         }
     }
 
-    @Before
-    public void cleanToStart()
+    protected static Device provisioningDevice(String deviceId) throws Exception
     {
-        deviceMethodStatusCallbackResult.status = IotHubStatusCode.ERROR;
-    }
+        String fullDeviceId = deviceId.concat("-" + uuid);
 
-    protected static void removeDevice() throws Exception
-    {
-        deviceClient.close();
-        registryManager.removeDevice(DEVICE_ID_NAME);
-    }
-
-    protected static String provisioningDevice() throws Exception
-    {
-        String uuid = UUID.randomUUID().toString();
-        DEVICE_ID_NAME = DEVICE_ID_NAME.concat("-" + System.getProperty("user.name") + "-" + uuid);
-
-        // Check if device exists with the given name
-        Boolean deviceExist = false;
-        try
-        {
-            registryManager.getDevice(DEVICE_ID_NAME);
-            deviceExist = true;
-        }
-        catch (IotHubException e)
-        {
-        }
-        if (deviceExist)
-        {
-            try
-            {
-                registryManager.removeDevice(DEVICE_ID_NAME);
-            } catch (IotHubException|IOException e)
-            {
-                System.out.println("Initialization failed, could not remove device: " + DEVICE_ID_NAME);
-                e.printStackTrace();
-            }
-        }
-
-        Device deviceAdded = Device.createFromId(DEVICE_ID_NAME, null, null);
+        Device deviceAdded = Device.createFromId(fullDeviceId, null, null);
         registryManager.addDevice(deviceAdded);
 
         try{
@@ -158,28 +120,72 @@ public class DeviceMethodIT
         }
         catch (Exception e){}
 
-        String[] connectionStrings = iotHubConnectionString.split(";");
+        return deviceAdded;
+    }
+    @Before
+    public void cleanToStart() throws InterruptedException
+    {
+        deviceMethodStatusCallbackResult.status = IotHubStatusCode.ERROR;
+        succeed.set(true);
+        failReason.clear();
+    }
 
-        return connectionStrings[0] + ";DeviceId=" + deviceAdded.getDeviceId() + ";SharedAccessKey=" + deviceAdded.getPrimaryKey();
+    private static void removeDevices() throws Exception
+    {
+        deviceClient.close();
+        registryManager.removeDevice(testDevice.getDeviceId());
+    }
+
+    private static String getConnectionString(String iotHubConnectionString, Device device)
+    {
+        StringBuilder stringBuilder = new StringBuilder();
+        String[] tokenArray = iotHubConnectionString.split(";");
+        String hostName = "";
+        for (String token:tokenArray)
+        {
+            String[] keyValueArray = token.split("=");
+            if (keyValueArray[0].equals("HostName"))
+            {
+                hostName =  token + ';';
+                break;
+            }
+        }
+
+        stringBuilder.append(hostName);
+        stringBuilder.append(String.format("DeviceId=%s", device.getDeviceId()));
+        stringBuilder.append(String.format(";SharedAccessKey=%s", device.getPrimaryKey()));
+        return stringBuilder.toString();
     }
 
     protected static class DeviceMethodStatusCallback implements IotHubEventCallback
     {
-        public void execute(IotHubStatusCode status, Object context)
+        public synchronized void execute(IotHubStatusCode status, Object context)
         {
-            DeviceStatus deviceStatus = (DeviceStatus)context;
-            deviceStatus.status = status;
+            DeviceStatus device = (DeviceStatus)context;
+            deviceMethodStatusCallbackResult.status = status;
         }
     }
 
     protected static class RunnableInvoke implements Runnable
     {
-        String name;
+        String deviceId;
+        String method;
+        Long responseTimeout;
+        Long connectionTimeout;
+        Object payload;
+        Integer expectedStatus;
+        String expectedPayload;
         CountDownLatch latch;
 
-        public RunnableInvoke(String name, CountDownLatch latch)
+        public RunnableInvoke(String deviceId, String method, Long responseTimeout, Long connectionTimeout, Object payload, Integer expectedStatus, String expectedPayload, CountDownLatch latch)
         {
-            this.name = name;
+            this.deviceId = deviceId;
+            this.method = method;
+            this.responseTimeout = responseTimeout;
+            this.connectionTimeout = connectionTimeout;
+            this.payload = payload;
+            this.expectedStatus = expectedStatus;
+            this.expectedPayload = expectedPayload;
             this.latch = latch;
         }
 
@@ -192,20 +198,34 @@ public class DeviceMethodIT
             // Act
             try
             {
-                result = methodServiceClient.invoke(DEVICE_ID_NAME, METHOD_LOOPBACK, RESPONSE_TIMEOUT, CONNECTION_TIMEOUT, name);
+                result = methodServiceClient.invoke(deviceId, method, responseTimeout, connectionTimeout, payload);
+
+                // Assert
+                if(result == null)
+                {
+                    succeed.set(false);
+                    failReason.add("invoke device " + deviceId + " returns null");
+                }
+                else if((long)result.getStatus() != (long)expectedStatus)
+                {
+                    succeed.set(false);
+                    failReason.add("invoke device " + deviceId + " returns status:" + ((long) result.getStatus()) + "  expected:" + expectedStatus);
+                }
+                else if(!result.getPayload().equals(expectedPayload))
+                {
+                    succeed.set(false);
+                    failReason.add("invoke device " + deviceId + " returns payload:" + result.getPayload().toString() + "  expected:" + expectedPayload);
+                }
             }
             catch (Exception e)
             {
-            }
-
-            // Assert
-            if((result == null) ||
-                    ((long)result.getStatus() != (long)METHOD_SUCCESS) ||
-                    !result.getPayload().equals(METHOD_LOOPBACK + ":" + name))
-            {
                 succeed.set(false);
+                failReason.add("invoke device " + deviceId + " throws:" + e.toString());
             }
-            latch.countDown();
+            finally
+            {
+                latch.countDown();
+            }
         }
     }
 
@@ -278,49 +298,92 @@ public class DeviceMethodIT
     @AfterClass
     public static void tearDown() throws Exception
     {
-        removeDevice();
+ //       removeDevices();
     }
 
     @Test
     public void invokeMethod_succeed() throws Exception
     {
         // Act
-        MethodResult result = methodServiceClient.invoke(DEVICE_ID_NAME, METHOD_LOOPBACK, RESPONSE_TIMEOUT, CONNECTION_TIMEOUT, PAYLOAD_STRING);
+        MethodResult result = methodServiceClient.invoke(testDevice.getDeviceId(), METHOD_LOOPBACK, RESPONSE_TIMEOUT, CONNECTION_TIMEOUT, PAYLOAD_STRING);
 
         // Assert
         assertNotNull(result);
-        assertEquals((long)METHOD_SUCCESS, (long)result.getStatus());
+        assertEquals((long) METHOD_SUCCESS, (long) result.getStatus());
         assertEquals(METHOD_LOOPBACK + ":" + PAYLOAD_STRING, result.getPayload());
         assertEquals(IotHubStatusCode.OK_EMPTY, deviceMethodStatusCallbackResult.status);
     }
 
     @Test
-    public void invokeMethod_invokeParallel_succeed() throws Exception
+    public void invokeMethod_invokeParallel_singleDevice_succeed() throws Exception
     {
-        List<Thread> threads = new ArrayList<>(NUMBER_INVOKES_PARALLEL);
         CountDownLatch cdl = new CountDownLatch(NUMBER_INVOKES_PARALLEL);
         succeed.set(true);
 
         for (int i = 0; i < NUMBER_INVOKES_PARALLEL; i++)
         {
-            Thread thread = new Thread(
+            String threadName = "Thread" + i;
+            new Thread(
                     new RunnableInvoke(
-                            "Thread" + i,
-                            cdl));
-            thread.start();
-            threads.add(thread);
+                            testDevice.getDeviceId(), METHOD_LOOPBACK, RESPONSE_TIMEOUT, CONNECTION_TIMEOUT, threadName,
+                            METHOD_SUCCESS, METHOD_LOOPBACK + ":" + threadName,
+                            cdl)).start();
         }
 
         cdl.await();
 
+        for (String fail:failReason)
+        {
+            System.out.println(fail);
+        }
         assertTrue("Invoking device method in parallel failed", succeed.get());
+    }
+
+    @Ignore
+    @Test
+    public void invokeMethod_invokeParallel_multipleDevice_succeed() throws Exception
+    {
+        int numberOfDevices = testDeviceArray.length;
+        List<DeviceClient> deviceClientArray = new LinkedList<>();
+        CountDownLatch cdl = new CountDownLatch(NUMBER_INVOKES_PARALLEL*numberOfDevices);
+        succeed.set(true);
+
+        for(Device device:testDeviceArray)
+        {
+            DeviceClient newDeviceClient = new DeviceClient(getConnectionString(iotHubConnectionString, device), deviceClientProtocol);
+            deviceClientArray.add(newDeviceClient);
+            newDeviceClient.open();
+            for (int i = 0; i < NUMBER_INVOKES_PARALLEL; i++)
+            {
+                String threadName = "Thread" + i;
+                new Thread(
+                        new RunnableInvoke(
+                                device.getDeviceId(), METHOD_LOOPBACK, RESPONSE_TIMEOUT, CONNECTION_TIMEOUT, threadName,
+                                METHOD_SUCCESS, METHOD_LOOPBACK + ":" + threadName,
+                                cdl)).start();
+            }
+        }
+
+        cdl.await();
+
+        for(DeviceClient deviceClient:deviceClientArray)
+        {
+            deviceClient.close();
+        }
+
+        for (String fail:failReason)
+        {
+            System.out.println(fail);
+        }
+        assertTrue("Invoking device method in parallel failed", succeed.get());
+
     }
 
     @Test
     public void invokeMethod_standardTimeout_succeed() throws Exception
     {
         // Act
-        MethodResult result = methodServiceClient.invoke(DEVICE_ID_NAME, METHOD_LOOPBACK, null, null, PAYLOAD_STRING);
+        MethodResult result = methodServiceClient.invoke(testDevice.getDeviceId(), METHOD_LOOPBACK, null, null, PAYLOAD_STRING);
 
         // Assert
         assertNotNull(result);
@@ -333,7 +396,7 @@ public class DeviceMethodIT
     public void invokeMethod_nullPayload_succeed() throws Exception
     {
         // Act
-        MethodResult result = methodServiceClient.invoke(DEVICE_ID_NAME, METHOD_LOOPBACK, RESPONSE_TIMEOUT, CONNECTION_TIMEOUT, null);
+        MethodResult result = methodServiceClient.invoke(testDevice.getDeviceId(), METHOD_LOOPBACK, RESPONSE_TIMEOUT, CONNECTION_TIMEOUT, null);
 
         // Assert
         assertNotNull(result);
@@ -346,7 +409,7 @@ public class DeviceMethodIT
     public void invokeMethod_number_succeed() throws Exception
     {
         // Act
-        MethodResult result = methodServiceClient.invoke(DEVICE_ID_NAME, METHOD_DELAY_IN_MILLISECONDS, RESPONSE_TIMEOUT, CONNECTION_TIMEOUT, "100");
+        MethodResult result = methodServiceClient.invoke(testDevice.getDeviceId(), METHOD_DELAY_IN_MILLISECONDS, RESPONSE_TIMEOUT, CONNECTION_TIMEOUT, "100");
 
         // Assert
         assertNotNull(result);
@@ -359,7 +422,7 @@ public class DeviceMethodIT
     public void invokeMethod_throws_NumberFormatException_failed() throws Exception
     {
         // Act
-        MethodResult result = methodServiceClient.invoke(DEVICE_ID_NAME, METHOD_DELAY_IN_MILLISECONDS, RESPONSE_TIMEOUT, CONNECTION_TIMEOUT, PAYLOAD_STRING);
+        MethodResult result = methodServiceClient.invoke(testDevice.getDeviceId(), METHOD_DELAY_IN_MILLISECONDS, RESPONSE_TIMEOUT, CONNECTION_TIMEOUT, PAYLOAD_STRING);
 
         // Assert
         assertNotNull(result);
@@ -372,7 +435,7 @@ public class DeviceMethodIT
     public void invokeMethod_unknown_failed() throws Exception
     {
         // Act
-        MethodResult result = methodServiceClient.invoke(DEVICE_ID_NAME, METHOD_UNKNOWN, RESPONSE_TIMEOUT, CONNECTION_TIMEOUT, PAYLOAD_STRING);
+        MethodResult result = methodServiceClient.invoke(testDevice.getDeviceId(), METHOD_UNKNOWN, RESPONSE_TIMEOUT, CONNECTION_TIMEOUT, PAYLOAD_STRING);
 
         // Assert
         assertNotNull(result);
@@ -386,7 +449,7 @@ public class DeviceMethodIT
     {
         try
         {
-            methodServiceClient.invoke(DEVICE_ID_NAME, METHOD_DELAY_IN_MILLISECONDS, (long)5, CONNECTION_TIMEOUT, "7000");
+            methodServiceClient.invoke(testDevice.getDeviceId(), METHOD_DELAY_IN_MILLISECONDS, (long)5, CONNECTION_TIMEOUT, "7000");
              assert true;
         }
         catch(IotHubGatewayTimeoutException expected)
@@ -395,7 +458,7 @@ public class DeviceMethodIT
         }
 
         // Act
-        MethodResult result = methodServiceClient.invoke(DEVICE_ID_NAME, METHOD_DELAY_IN_MILLISECONDS, RESPONSE_TIMEOUT, CONNECTION_TIMEOUT, "100");
+        MethodResult result = methodServiceClient.invoke(testDevice.getDeviceId(), METHOD_DELAY_IN_MILLISECONDS, RESPONSE_TIMEOUT, CONNECTION_TIMEOUT, "100");
 
         // Assert
         assertNotNull(result);
@@ -409,7 +472,7 @@ public class DeviceMethodIT
     public void invokeMethod_timeout_failed() throws Exception
     {
         // Act
-        MethodResult result = methodServiceClient.invoke(DEVICE_ID_NAME, METHOD_DELAY_IN_MILLISECONDS, (long)5, CONNECTION_TIMEOUT, "7000");
+        MethodResult result = methodServiceClient.invoke(testDevice.getDeviceId(), METHOD_DELAY_IN_MILLISECONDS, (long)5, CONNECTION_TIMEOUT, "7000");
     }
 
 }
