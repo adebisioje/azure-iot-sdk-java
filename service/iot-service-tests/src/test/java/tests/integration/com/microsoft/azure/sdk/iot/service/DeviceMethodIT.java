@@ -298,7 +298,7 @@ public class DeviceMethodIT
     @AfterClass
     public static void tearDown() throws Exception
     {
- //       removeDevices();
+        removeDevices();
     }
 
     @Test
