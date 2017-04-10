@@ -99,6 +99,7 @@ public class SendMessagesIT
         private void OpenConnection() throws URISyntaxException, IOException
         {
             client = new DeviceClient(connString, protocol);
+            System.out.println("OPEN:" + connString);
             client.open();
         }
 
@@ -116,6 +117,7 @@ public class SendMessagesIT
 
                     Success messageSent = new Success();
                     EventCallback callback = new EventCallback();
+                    System.out.println("SEND:" + connString);
                     client.sendEventAsync(msgSend, callback, messageSent);
 
                     Integer waitDuration = 0;
@@ -142,6 +144,7 @@ public class SendMessagesIT
 
         public void CloseConnection() throws IOException
         {
+            System.out.println("CLOSE:" + connString);
             client.close();
         }
     }
